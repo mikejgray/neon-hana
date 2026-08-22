@@ -28,7 +28,7 @@ from asyncio import run, get_event_loop
 from os import makedirs
 from queue import Queue
 from time import time, sleep
-from typing import Optional
+from typing import List, NamedTuple, Optional
 from fastapi import WebSocket
 from neon_data_models.models.api.node_v1 import NodeHello
 from neon_iris.client import NeonAIClient
@@ -38,6 +38,26 @@ from pydantic import ValidationError
 from threading import RLock
 from ovos_utils.log import LOG
 
+from neon_data_models.enum import NotificationPermission, NotificationScope
+from neon_data_models.models.api.messagebus.notifications import (
+    NeonNotificationDismiss, NeonNotificationNotify, NeonNotificationSnoozed)
+
+from neon_hana.node_registry import NodeRegistry, default_registry_path
+
+# Fanout exchange the messagebus-MQ connector publishes Notification Manager
+# events to. Must stay in sync with `NOTIFICATIONS_EXCHANGE` in
+# neon-messagebus-mq-connector.
+NOTIFICATIONS_EXCHANGE = "neon_notifications"
+NOTIFICATIONS_CONSUMER = "neon_notifications_handler"
+NOTIFICATION_MODELS = {
+    NeonNotificationNotify.model_fields["msg_type"].default:
+        NeonNotificationNotify,
+    NeonNotificationDismiss.model_fields["msg_type"].default:
+        NeonNotificationDismiss,
+    NeonNotificationSnoozed.model_fields["msg_type"].default:
+        NeonNotificationSnoozed,
+}
+
 
 class ClientNotKnown(RuntimeError):
     """
@@ -45,11 +65,44 @@ class ClientNotKnown(RuntimeError):
     """
 
 
+class NotificationAddress(NamedTuple):
+    """
+    Where a notification event is addressed. `scope` is None only on a
+    `snoozed` event that omits it, which is broadcast by notification_id.
+    """
+    scope: Optional[NotificationScope]
+    target: Optional[str]
+    permission: NotificationPermission
+
+
+def _notification_address(event) -> NotificationAddress:
+    """
+    Read the address from a parsed notification event. `notify` nests it in
+    the notification itself; `dismiss` and `snoozed` carry `scope`/`target`
+    at the top level of `data` and are not permission-gated, since an
+    id-only lifecycle event discloses no notification content.
+    @param event: parsed NeonNotificationNotify/Dismiss/Snoozed
+    @return: scope, target and the permission required to display the event
+    """
+    if isinstance(event, NeonNotificationNotify):
+        notification = event.data.notification
+        return NotificationAddress(notification.scope, notification.target,
+                                   notification.permission)
+    return NotificationAddress(event.data.scope, event.data.target,
+                               NotificationPermission.PUBLIC)
+
+
 class MQWebsocketAPI(NeonAIClient):
-    def __init__(self, config: dict):
+    def __init__(self, config: dict,
+                 node_registry: Optional[NodeRegistry] = None):
         """
         Creates an MQWebsocketAPI to serve multiple client WS connections.
+        @param config: `hana` configuration
+        @param node_registry: registry used to resolve notification targets;
+            created from `config["node_registry_path"]` when not supplied
         """
+        self._node_registry = node_registry or NodeRegistry(
+            config.get("node_registry_path") or default_registry_path())
         mq_config = config.get("MQ") or dict()
         config_dir = "/tmp/hana"
         makedirs(config_dir, exist_ok=True)
@@ -57,6 +110,31 @@ class MQWebsocketAPI(NeonAIClient):
         self._sessions = dict()
         self._session_lock = RLock()
         self._client = "neon_node_websocket"
+
+    @property
+    def node_registry(self) -> NodeRegistry:
+        return self._node_registry
+
+    def _init_mq_connection(self):
+        mq_connection = super()._init_mq_connection()
+        self._subscribe_to_notifications(mq_connection)
+        return mq_connection
+
+    def _subscribe_to_notifications(self, mq_connection):
+        """
+        Bind an instance-unique queue to the `neon_notifications` fanout
+        exchange so hub-originated notification events reach this instance.
+        `NeonAIClient._init_mq_connection` returns only after the
+        connector's `run()` has started every consumer registered at that
+        time, so registering afterwards means this consumer is started exactly
+        once, here.
+        @param mq_connection: connected IrisConnector
+        """
+        mq_connection.register_subscriber(NOTIFICATIONS_CONSUMER, self._vhost,
+                                          self.handle_notification_broadcast,
+                                          exchange=NOTIFICATIONS_EXCHANGE,
+                                          auto_ack=False)
+        mq_connection.run_consumers(names=(NOTIFICATIONS_CONSUMER,))
 
     def check_health(self) -> bool:
         """
@@ -166,6 +244,12 @@ class MQWebsocketAPI(NeonAIClient):
             default_context["node"] = {
                 **node_context,
                 "site_id": self.get_session(session_id).get("site_id")}
+        # The JWT owner recorded at connect is the authoritative user for
+        # this Node; `username` above is the hub's default profile, not the
+        # caller, so hub services (e.g. the Notification Manager) read this
+        owner = self._node_registry.owner(session_id)
+        if owner:
+            default_context["user_id"] = owner
         return {**message.context, **default_context}
 
     def _update_session_data(self, message: Message):
@@ -222,6 +306,8 @@ class MQWebsocketAPI(NeonAIClient):
         with self._session_lock:
             if session_id in self._sessions:
                 self._sessions[session_id]["node"] = node
+        self._node_registry.update_hello(session_id, node["node_name"],
+                                         node["capabilities"])
         self._send_hello_response(session_id, node=node)
 
     def _send_hello_response(self, session_id: str, node: dict = None,
@@ -292,11 +378,120 @@ class MQWebsocketAPI(NeonAIClient):
         """
         try:
             run(self.send_to_client(message))
-        except KeyError:
-            LOG.error(f"node.invoke_native for unknown session: "
-                      f"{message.context.get('session', {}).get('session_id')}")
         except Exception as e:
             LOG.exception(e)
+
+    def handle_notification_broadcast(self, channel, method, _, body):
+        """
+        Consumer callback for the `neon_notifications` exchange. Decodes the
+        MQ payload and hands it to `handle_notification`. The exchange only
+        carries the three Notification Manager event types, so this bypasses
+        iris' per-session dispatch chain (and works with iris releases that
+        predate `handle_notification`).
+        """
+        channel.basic_ack(delivery_tag=method.delivery_tag)
+        try:
+            payload = b64_to_dict(body)
+            message = Message(payload.get("msg_type"), payload.get("data"),
+                              payload.get("context"))
+        except Exception as e:
+            LOG.error("Dropping undecodable notification broadcast: %s", e)
+            return
+        try:
+            self.handle_notification(message)
+        except Exception as e:
+            LOG.exception(e)
+
+    @staticmethod
+    def _parse_notification(message: Message):
+        """
+        Validate a notification event against its data model.
+        @param message: notification event from the bus
+        @return: parsed NeonNotificationNotify/Dismiss/Snoozed, or None if the
+            message type is unexpected or the payload fails validation
+        """
+        model = NOTIFICATION_MODELS.get(message.msg_type)
+        if model is None:
+            LOG.warning("Ignoring unexpected message on %s: %s",
+                        NOTIFICATIONS_EXCHANGE, message.msg_type)
+            return None
+        try:
+            return model(data=message.data or {},
+                         context=message.context or {})
+        except ValidationError as e:
+            LOG.warning("Dropping invalid %s payload: %s",
+                        message.msg_type, e)
+            return None
+
+    def handle_notification(self, message: Message):
+        """
+        Route a Notification Manager event (`notify`/`dismiss`/`snoozed`) to
+        every connected Node it is addressed to: CLIENT scope targets one
+        node_id, USER scope every node owned by the target user, GLOBAL scope
+        every connected session. Nodes that are offline catch up over REST,
+        so a miss is not an error.
+        @param message: notification event from the bus
+        """
+        event = self._parse_notification(message)
+        if event is None:
+            return
+        scope, target, permission = _notification_address(event)
+        if scope is None:
+            # A `snoozed` event may omit scope/target. An id-only lifecycle
+            # event is safe to broadcast; consumers drop ids they do not hold.
+            scope = NotificationScope.GLOBAL
+        targets = self._notification_targets(scope, target, permission)
+        LOG.debug("Routing %s scope=%s target=%s to %s", message.msg_type,
+                  scope.name, target, targets)
+        for session_id in targets:
+            try:
+                run(self.send_to_client(message, session_id))
+            except Exception as e:
+                LOG.error("Failed to deliver %s to %s: %s",
+                          message.msg_type, session_id, e)
+
+    def _notification_targets(self, scope: NotificationScope,
+                              target: Optional[str],
+                              permission: NotificationPermission) -> List[str]:
+        """
+        Connected sessions a notification may be delivered to: registry
+        resolution intersected with a locked snapshot of live sessions.
+        PERSONAL and PRIVATE notifications are delivered only to sessions
+        owned by the target user; sessions authenticated as a different user
+        are withheld.
+        """
+        with self._session_lock:
+            connected = list(self._sessions)
+        if scope == NotificationScope.GLOBAL:
+            return connected
+        candidates = [node_id for node_id in
+                      self._node_registry.resolve(scope, target)
+                      if node_id in connected]
+        if permission < NotificationPermission.PERSONAL:
+            return candidates
+        return self._owned_by_target_user(candidates, scope, target,
+                                          permission)
+
+    def _owned_by_target_user(self, candidates: List[str],
+                              scope: NotificationScope, target: Optional[str],
+                              permission: NotificationPermission) -> List[str]:
+        """
+        Restrict `candidates` to sessions owned by the notification's target
+        user. With no known owner the notification is withheld entirely.
+        """
+        target_user = target if scope == NotificationScope.USER else \
+            self._node_registry.owner(target)
+        if not target_user:
+            LOG.warning("Withholding %s notification: no owner known for "
+                        "target %s", permission.name, target)
+            return []
+        allowed = [node_id for node_id in candidates
+                   if self._node_registry.owner(node_id) == target_user]
+        withheld = sorted(set(candidates) - set(allowed))
+        if withheld:
+            LOG.warning("Withheld %s notification from sessions not owned by "
+                        "%s: %s", permission.name, target_user, withheld)
+        return allowed
 
     def handle_klat_response(self, message: Message):
         """
@@ -360,14 +555,26 @@ class MQWebsocketAPI(NeonAIClient):
         """
         run(self.send_to_client(message))
 
-    async def send_to_client(self, message: Message):
+    async def send_to_client(self, message: Message,
+                             session_id: Optional[str] = None):
         """
         Asynchronously forward a message from Neon/MQ to a WebSocket client.
+        A client that is not connected is a normal condition (it catches up
+        over REST), so a miss is logged rather than raised.
         @param message: Message to forward to a WebSocket client
+        @param session_id: Target session; defaults to
+            `message.context.session.session_id`
         """
         # TODO: Drop context?
-        session_id = message.context["session"]["session_id"]
-        await self._sessions[session_id]["socket"].send_text(message.serialize())
+        session_id = session_id or \
+            (message.context.get("session") or {}).get("session_id")
+        with self._session_lock:
+            session = self._sessions.get(session_id)
+        if not session:
+            LOG.debug("No connected session %s for %s", session_id,
+                      message.msg_type)
+            return
+        await session["socket"].send_text(message.serialize())
 
     def shutdown(self, *_, **__):
         """

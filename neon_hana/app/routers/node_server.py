@@ -32,7 +32,7 @@ from fastapi import APIRouter, WebSocket, HTTPException
 from ovos_utils import LOG
 from starlette.websockets import WebSocketDisconnect
 
-from neon_hana.app.dependencies import config, client_manager
+from neon_hana.app.dependencies import config, client_manager, node_registry
 from neon_hana.mq_websocket_api import MQWebsocketAPI, ClientNotKnown
 
 from neon_data_models.enum import AccessRoles
@@ -49,11 +49,18 @@ from neon_data_models.models.api.node_v1 import (NodeAudioInput, NodeGetStt,
                                                  CoreIntentFailure,
                                                  CoreErrorResponse,
                                                  CoreClearData,
-                                                 CoreAlertExpired)
+                                                 CoreAlertExpired,
+                                                 CoreNotification,
+                                                 CoreNotificationDismiss,
+                                                 CoreNotificationSnoozed,
+                                                 NodeNotificationRemove,
+                                                 NodeNotificationSnooze,
+                                                 NodeNotificationInteraction,
+                                                 NodeNotificationSync)
 
 node_route = APIRouter(prefix="/node", tags=["node"])
 
-socket_api = MQWebsocketAPI(config)
+socket_api = MQWebsocketAPI(config, node_registry)
 signal(SIGINT, socket_api.shutdown)
 
 
@@ -63,14 +70,16 @@ async def node_v1_endpoint(websocket: WebSocket, token: str):
     if not client_manager.validate_auth(token, client_id):
         raise HTTPException(status_code=403,
                             detail="Invalid or expired token.")
-    permissions = PermissionsConfig.from_roles(
-        client_manager.get_token_data(token).roles)
+    token_data = client_manager.get_token_data(token)
+    permissions = PermissionsConfig.from_roles(token_data.roles)
     if not any((permissions.node > AccessRoles.GUEST,
                 permissions.node == AccessRoles.NODE,
                 config.get("disable_auth"))):
         raise HTTPException(status_code=401,
                             detail=f"Client not authorized for node access "
                                    f"({client_id})")
+    # JWT claims are authoritative for node identity and ownership
+    node_registry.upsert_connect(client_id, token_data.sub)
     await websocket.accept()
     disconnect_event = Event()
 
@@ -114,12 +123,18 @@ async def node_v1_stream_endpoint(websocket: WebSocket, token: str):
 @node_route.get("/v1/doc")
 async def node_v1_doc(_: Optional[Union[NodeAudioInput, NodeGetStt,
                                         NodeGetTts, NodeHello,
-                                        NodeInvokeNativeResponse]]) -> \
+                                        NodeInvokeNativeResponse,
+                                        NodeNotificationRemove,
+                                        NodeNotificationSnooze,
+                                        NodeNotificationInteraction,
+                                        NodeNotificationSync]]) -> \
         Optional[Union[NodeKlatResponse, NodeAudioInputResponse,
                        NodeGetSttResponse, NodeGetTtsResponse,
                        NodeInvokeNative,
                        CoreWWDetected, CoreIntentFailure, CoreErrorResponse,
-                       CoreClearData, CoreAlertExpired]]:
+                       CoreClearData, CoreAlertExpired,
+                       CoreNotification, CoreNotificationDismiss,
+                       CoreNotificationSnoozed]]:
     """
     The node endpoint (`/node/v1`) accepts and returns JSON objects representing
     Messages. All inputs and responses will contain keys:

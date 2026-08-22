@@ -37,6 +37,7 @@ from neon_hana.app.routers.user import user_route
 from neon_hana.app.routers.util import util_route
 from neon_hana.app.routers.hub import hub_route
 from neon_hana.app.routers.node_server import node_route, socket_api
+from neon_hana.app.routers.notifications import notifications_route
 from neon_hana.version import __version__
 
 
@@ -55,6 +56,7 @@ def create_app(config: dict):
     app.include_router(user_route)
     app.include_router(bf_route)
     app.include_router(hub_route)
+    app.include_router(notifications_route)
 
     @app.get("/status")
     def get_status():

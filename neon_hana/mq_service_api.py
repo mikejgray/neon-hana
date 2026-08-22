@@ -27,8 +27,9 @@
 import json
 import warnings
 
+from datetime import datetime
 from time import time
-from typing import Optional, Dict, Any, List, Tuple, Union
+from typing import NamedTuple, Optional, Dict, Any, List, Tuple, Union
 from uuid import uuid4
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -43,12 +44,28 @@ from neon_mq_connector.utils.client_utils import send_mq_request
 from neon_data_models.models.client.node import NodeData
 from neon_data_models.models.user.neon_profile import UserProfile
 from neon_data_models.models.user import User
+from neon_data_models.enum import NotificationState
+from neon_data_models.models.api.messagebus.notifications import (
+    NeonNotificationInteraction, NeonNotificationList, NeonNotificationRemove,
+    NeonNotificationSnooze, NotificationInteractionData, NotificationListData,
+    NotificationListResponseData, NotificationRemoveData,
+    NotificationSnoozeData)
 
 
 class APIError(HTTPException):
     """
     Exception class representing errors in getting responses from the MQ API
     """
+
+
+class NotificationRequester(NamedTuple):
+    """
+    Identity of the Node making a notification request, taken from its JWT.
+    The Notification Manager applies its removal and permission policy
+    against this identity.
+    """
+    node_id: str
+    user_id: str
 
 
 class AsyncMqServiceManager:
@@ -413,6 +430,119 @@ class AsyncMqServiceManager:
             raise APIError(status_code=500,
                            detail="No response received from skills API")
         return response.get('data', {})
+
+    def _bus_request(self, msg_type: str, data: dict,
+                     requester: NotificationRequester) -> dict:
+        """
+        Build a serialized Messagebus request for the Notification Manager.
+        @param msg_type: fixed message type of the calling method
+        @param data: validated message data
+        @param requester: identity the manager applies its policy against
+        @returns: serialized Message ready for `_send_mq_request_async`
+        """
+        return {"msg_type": msg_type,
+                "data": data,
+                "context": {"source": "hana",
+                            "ident": f"{self.mq_client_id}{time()}",
+                            "session": {"session_id": requester.node_id},
+                            "node": {"node_id": requester.node_id},
+                            "user_id": requester.user_id}}
+
+    async def _notification_request(self, msg_type: str, data: dict,
+                                    requester: NotificationRequester) -> dict:
+        """
+        Round-trip a Notification Manager request and return its `data`.
+        @param msg_type: fixed message type of the calling method
+        @param data: validated message data
+        @param requester: identity the manager applies its policy against
+        @returns: `data` of the manager's response Message
+        @raises APIError: 504 if the Notification Manager does not answer
+        """
+        response = await self._send_mq_request_async(
+            "/neon_chat_api", self._bus_request(msg_type, data, requester),
+            "neon_chat_api_request", timeout=self.mq_default_timeout)
+        if not response:
+            raise APIError(
+                status_code=504,
+                detail="No response received from the Notification Manager")
+        return response.get("data") or {}
+
+    async def list_notifications(self, requester: NotificationRequester,
+                                 since: Optional[datetime] = None,
+                                 state: Optional[NotificationState] = None) \
+            -> NotificationListResponseData:
+        """
+        Fetch the notifications addressed to `requester` for offline catch-up.
+        @param requester: identity of the calling Node
+        @param since: only notifications updated after this time
+        @param state: only notifications in this lifecycle state; None also
+            returns dismissed/expired tombstones so a client can reconcile
+        @returns: notifications and their manager-side states
+        """
+        request = NotificationListData(node_id=requester.node_id,
+                                       user_id=requester.user_id,
+                                       since=since, state=state)
+        data = await self._notification_request(
+            NeonNotificationList.model_fields["msg_type"].default,
+            request.model_dump(mode="json", exclude_none=True), requester)
+        return NotificationListResponseData(
+            notifications=data.get("notifications") or [],
+            states=data.get("states") or {})
+
+    async def remove_notification(self, requester: NotificationRequester,
+                                  notification_id: str) -> dict:
+        """
+        Ask the Notification Manager to remove a notification.
+        @param requester: identity of the calling Node
+        @param notification_id: notification to remove
+        @returns: `data` of the manager's response; the manager is
+            authoritative and may refuse the request
+        """
+        request = NotificationRemoveData(notification_id=notification_id,
+                                         dismissed_by=requester.node_id)
+        return await self._notification_request(
+            NeonNotificationRemove.model_fields["msg_type"].default,
+            request.model_dump(mode="json", exclude_none=True), requester)
+
+    async def snooze_notification(self, requester: NotificationRequester,
+                                  notification_id: str,
+                                  duration: int) -> dict:
+        """
+        Ask the Notification Manager to hide a notification temporarily.
+        @param requester: identity of the calling Node
+        @param notification_id: notification to snooze
+        @param duration: seconds to hide the notification before re-notifying
+        @returns: `data` of the manager's response; the manager owns the
+            snooze timer and may refuse the request
+        """
+        request = NotificationSnoozeData(notification_id=notification_id,
+                                         duration=duration)
+        return await self._notification_request(
+            NeonNotificationSnooze.model_fields["msg_type"].default,
+            request.model_dump(mode="json"), requester)
+
+    async def send_notification_interaction(
+            self, requester: NotificationRequester, notification_id: str,
+            action_id: str, callback_data: Optional[dict] = None):
+        """
+        Emit a notification interaction for the producing skill. Fire and
+        forget: the producer handles the interaction asynchronously.
+        @param requester: identity of the calling Node
+        @param notification_id: notification the user interacted with
+        @param action_id: `NotificationAction.action_id` that was activated
+        @param callback_data: `Notification.callback_data` to echo back
+        """
+        request = NotificationInteractionData(
+            notification_id=notification_id, action_id=action_id,
+            callback_data=callback_data or {})
+        msg_type = NeonNotificationInteraction.model_fields[
+            "msg_type"].default
+        await self._send_mq_request_async(
+            "/neon_chat_api",
+            self._bus_request(msg_type, request.model_dump(mode="json"),
+                              requester),
+            "neon_chat_api_request", timeout=self.mq_default_timeout,
+            expect_response=False)
 
 
 class MQServiceManager:

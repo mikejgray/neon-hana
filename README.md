@@ -31,6 +31,7 @@ hana:
   tts_max_words: 128  # Arbitrary limit that is longer than any default LLM token limit
   enable_email: True  # Disabled by default; anyone with access to the API will be able to send emails from the configured address
   max_streaming_clients: -1  # Maximum audio streaming clients allowed (including 0). Default unset value allows infinite clients
+  node_registry_path: /config/neon/hana/node_registry.json  # Persistent Node registry used to route notifications. Defaults to `$XDG_CONFIG_HOME/neon/hana/node_registry.json`
 ```
 It is recommended to generate unique values for configured tokens, these are 32
 bytes in hexadecimal representation.

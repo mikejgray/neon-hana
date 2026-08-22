@@ -28,8 +28,11 @@ from ovos_config.config import Configuration
 
 from neon_hana.mq_service_api import AsyncMqServiceManager
 from neon_hana.auth.client_manager import ClientManager, UserTokenAuth
+from neon_hana.node_registry import NodeRegistry, default_registry_path
 
 config = Configuration().get("hana") or dict()
 mq_connector = AsyncMqServiceManager(config)
 client_manager = ClientManager(config, mq_connector)
 jwt_bearer = UserTokenAuth(client_manager)
+node_registry = NodeRegistry(config.get("node_registry_path") or
+                             default_registry_path())

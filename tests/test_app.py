@@ -1,19 +1,30 @@
 import json
+import os
+import tempfile
+
 from time import time
 from unittest import TestCase
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from neon_data_models.enum import NotificationPermission, NotificationScope
+from neon_data_models.models.base.notifications import Notification
 from neon_data_models.models.user import User
 from neon_data_models.models.user.database import PermissionsConfig
 
+_REGISTRY_DIR = tempfile.TemporaryDirectory()
+
 _TEST_CONFIG = {
+    "node_registry_path": os.path.join(_REGISTRY_DIR.name, "node_registry.json"),
     "mq_default_timeout": 10,
     "access_token_ttl": 86400,  # 1 day
     "refresh_token_ttl": 604800,  # 1 week
-    "requests_per_minute": 60,
-    "auth_requests_per_minute": 60,
+    # The whole suite shares one `testclient` rate-limit bucket, so this is
+    # set well above the suite's request count rather than at a realistic
+    # per-client limit
+    "requests_per_minute": 1000,
+    "auth_requests_per_minute": 1000,
     "access_token_secret": "a800445648142061fc238d1f84e96200da87f4f9f784108ac90db8b4391b117b",
     "refresh_token_secret": "833d369ac73d883123743a44b4a7fe21203cffc956f4c8a99be6e71aafa8e1aa",
     "server_host": "0.0.0.0",
@@ -835,5 +846,232 @@ class TestHanaApp(TestCase):
             with patch.dict(os.environ, {"XDG_CONFIG_HOME": tmpdir}):
                 result = _read_neon_yaml()
             self.assertEqual(result, {})
+
+    @staticmethod
+    def _bus_request(send_request) -> dict:
+        """The serialized Message HANA handed to `send_mq_request`"""
+        return send_request.call_args[0][1]
+
+    @patch("neon_hana.mq_service_api.send_mq_request")
+    def test_notifications_list(self, send_request):
+        notification = Notification(notification_id="n1",
+                                    skill_id="skill-test", text="hello",
+                                    scope=NotificationScope.USER,
+                                    target="user-a",
+                                    permission=NotificationPermission.PERSONAL)
+        send_request.return_value = {
+            "msg_type": "ovos.notification.api.list.response",
+            "data": {"notifications": [notification.model_dump(mode="json")],
+                     "states": {"n1": "active"}},
+            "context": {}}
+        token = self._get_tokens()["access_token"]
+
+        # Valid request
+        response = self.test_app.get(
+            "/notifications",
+            params={"since": "2026-08-20T00:00:00Z", "state": "active"},
+            headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertEqual(data["notifications"][0]["notification_id"], "n1")
+        self.assertEqual(data["states"], {"n1": "active"})
+        self.assertIsInstance(data["server_time"], str)
+
+        request = self._bus_request(send_request)
+        self.assertEqual(request["msg_type"], "ovos.notification.api.list")
+        self.assertEqual(request["data"]["state"], "active")
+        self.assertEqual(request["data"]["since"], "2026-08-20T00:00:00Z")
+        self.assertEqual(request["data"]["node_id"],
+                         request["context"]["node"]["node_id"])
+        self.assertEqual(request["data"]["user_id"],
+                         request["context"]["user_id"])
+        self.assertEqual(request["context"]["session"]["session_id"],
+                         request["data"]["node_id"])
+
+        # No state filter and no cursor: neither key is sent, so the manager
+        # returns dismissed/expired tombstones for reconciliation
+        response = self.test_app.get(
+            "/notifications", headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 200, response.text)
+        request = self._bus_request(send_request)
+        self.assertNotIn("state", request["data"])
+        self.assertNotIn("since", request["data"])
+
+        # Catch-up cursor alone still sends no state filter
+        response = self.test_app.get(
+            "/notifications", params={"since": "2026-08-20T00:00:00Z"},
+            headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 200, response.text)
+        request = self._bus_request(send_request)
+        self.assertNotIn("state", request["data"])
+
+        # Invalid missing auth
+        response = self.test_app.get("/notifications")
+        self.assertIn(response.status_code, [401, 403], response.text)
+
+        # Invalid cursor
+        response = self.test_app.get(
+            "/notifications", params={"since": "yesterday"},
+            headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 422, response.text)
+
+        # Invalid lifecycle state
+        response = self.test_app.get(
+            "/notifications", params={"state": "unread"},
+            headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 422, response.text)
+
+    @patch("neon_hana.mq_service_api.send_mq_request")
+    def test_notifications_list_no_manager_response(self, send_request):
+        send_request.return_value = {}
+        token = self._get_tokens()["access_token"]
+        response = self.test_app.get(
+            "/notifications", headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 504, response.text)
+
+    @patch("neon_hana.mq_service_api.send_mq_request")
+    def test_notifications_dismiss(self, send_request):
+        send_request.return_value = {
+            "msg_type": "ovos.notification.api.remove.response",
+            "data": {"notification_ids": ["n1"], "status": "ok"},
+            "context": {}}
+        token = self._get_tokens()["access_token"]
+
+        # Valid request
+        response = self.test_app.post(
+            "/notifications/n1/dismiss",
+            headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(),
+                         {"notification_id": "n1", "status": "dismissed"})
+        request = self._bus_request(send_request)
+        self.assertEqual(request["msg_type"], "ovos.notification.api.remove")
+        self.assertEqual(request["data"]["notification_id"], "n1")
+        self.assertEqual(request["data"]["dismissed_by"],
+                         request["context"]["node"]["node_id"])
+
+        # Refused by the Notification Manager
+        send_request.return_value = {
+            "data": {"notification_ids": [], "status": "refused",
+                     "reason": "removable_by_user is False"}}
+        response = self.test_app.post(
+            "/notifications/n1/dismiss",
+            headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertEqual(response.json()["detail"],
+                         "removable_by_user is False")
+
+        # Unknown notification
+        send_request.return_value = {
+            "data": {"notification_ids": [], "status": "not_found"}}
+        response = self.test_app.post(
+            "/notifications/n1/dismiss",
+            headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 404, response.text)
+
+        # No response from the Notification Manager
+        send_request.return_value = {}
+        response = self.test_app.post(
+            "/notifications/n1/dismiss",
+            headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 504, response.text)
+
+        # Invalid missing auth
+        response = self.test_app.post("/notifications/n1/dismiss")
+        self.assertIn(response.status_code, [401, 403], response.text)
+
+    @patch("neon_hana.mq_service_api.send_mq_request")
+    def test_notifications_snooze(self, send_request):
+        send_request.return_value = {
+            "msg_type": "ovos.notification.api.snooze.response",
+            "data": {"notification_id": "n1", "status": "ok",
+                     "renotify_at": "2026-08-21T08:00:00+00:00"},
+            "context": {}}
+        token = self._get_tokens()["access_token"]
+
+        # Valid request
+        response = self.test_app.post(
+            "/notifications/n1/snooze", json={"duration": 600},
+            headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["notification_id"], "n1")
+        self.assertEqual(response.json()["renotify_at"],
+                         "2026-08-21T08:00:00Z")
+        request = self._bus_request(send_request)
+        self.assertEqual(request["msg_type"], "ovos.notification.api.snooze")
+        self.assertEqual(request["data"],
+                         {"notification_id": "n1", "duration": 600})
+
+        # Refused by the Notification Manager
+        send_request.return_value = {
+            "data": {"notification_id": "n1", "status": "refused",
+                     "reason": "not snoozable"}}
+        response = self.test_app.post(
+            "/notifications/n1/snooze", json={"duration": 600},
+            headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 403, response.text)
+
+        # Accepted without a `renotify_at` the client can act on
+        send_request.return_value = {
+            "data": {"notification_id": "n1", "status": "ok"}}
+        response = self.test_app.post(
+            "/notifications/n1/snooze", json={"duration": 600},
+            headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 504, response.text)
+
+        # Invalid request
+        for body in ({"duration": 0}, {"duration": "soon"}, {}):
+            response = self.test_app.post(
+                "/notifications/n1/snooze", json=body,
+                headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(response.status_code, 422, response.text)
+
+        # Invalid missing auth
+        response = self.test_app.post("/notifications/n1/snooze",
+                                      json={"duration": 600})
+        self.assertIn(response.status_code, [401, 403], response.text)
+
+    @patch("neon_hana.mq_service_api.send_mq_request")
+    def test_notifications_interaction(self, send_request):
+        send_request.return_value = {}
+        token = self._get_tokens()["access_token"]
+
+        # Valid request is accepted without waiting for the producer
+        response = self.test_app.post(
+            "/notifications/n1/interaction",
+            json={"action_id": "open",
+                  "callback_data": {"report_date": "2026-08-20"}},
+            headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(response.json(),
+                         {"notification_id": "n1", "status": "accepted"})
+        self.assertFalse(send_request.call_args.kwargs["expect_response"])
+        request = self._bus_request(send_request)
+        self.assertEqual(request["msg_type"],
+                         "ovos.notification.api.interaction")
+        self.assertEqual(request["data"],
+                         {"notification_id": "n1", "action_id": "open",
+                          "callback_data": {"report_date": "2026-08-20"}})
+
+        # callback_data defaults to empty when not supplied
+        response = self.test_app.post(
+            "/notifications/n1/interaction", json={"action_id": "snooze"},
+            headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(self._bus_request(send_request)["data"],
+                         {"notification_id": "n1", "action_id": "snooze",
+                          "callback_data": {}})
+
+        # Invalid request
+        for body in ({"callback_data": {}}, {}):
+            response = self.test_app.post(
+                "/notifications/n1/interaction", json=body,
+                headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(response.status_code, 422, response.text)
+
+        # Invalid missing auth
+        response = self.test_app.post("/notifications/n1/interaction",
+                                      json={"action_id": "open"})
+        self.assertIn(response.status_code, [401, 403], response.text)
 
 # TODO: Define node endpoint tests

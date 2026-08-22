@@ -8,4 +8,4 @@ neon-mq-connector~=0.7,>=0.8.1a3
 neon-utils>=1.14.1a1
 ovos-config~=0.0,>=0.0.12
 ovos-utils~=0.0,>=0.0.38
-neon-data-models~=0.0,>=0.0.3a2
+neon-data-models~=0.0,>=0.0.3a5
